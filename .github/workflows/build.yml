@@ -1,1 +1,229 @@
+name: Flutter APK Build
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag GitHub Release yang berisi source ZIP dari bot"
+        required: true
+        type: string
+      build_type:
+        description: "Jenis build"
+        required: true
+        type: choice
+        options:
+          - release
+          - debug
+        default: release
+
+permissions:
+  contents: read
+  actions: read
+
+concurrency:
+  group: flutter-apk-${{ inputs.tag }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: Download Source & Build APK
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    steps:
+      - name: Checkout workflow repository
+        uses: actions/checkout@v4
+
+      - name: Validate inputs and download source ZIP
+        id: source
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPOSITORY: ${{ github.repository }}
+          SOURCE_TAG: ${{ inputs.tag }}
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          echo "::group::Validasi source"
+          if [[ -z "${SOURCE_TAG// /}" ]]; then
+            echo "::error title=Input tag kosong::Bot tidak mengirim input tag release."
+            exit 1
+          fi
+
+          api="https://api.github.com/repos/${GH_REPOSITORY}/releases/tags/${SOURCE_TAG}"
+          code="$(curl -sS -o /tmp/release.json -w '%{http_code}' \
+            -H "Authorization: Bearer ${GH_TOKEN}" \
+            -H "Accept: application/vnd.github+json" \
+            -H "X-GitHub-Api-Version: 2022-11-28" "$api")"
+
+          if [[ "$code" != "200" ]]; then
+            echo "::error title=Release source tidak ditemukan::GitHub API mengembalikan HTTP ${code} untuk tag ${SOURCE_TAG}. Pastikan release dibuat bot dan token memiliki izin membaca Contents."
+            cat /tmp/release.json
+            exit 1
+          fi
+
+          asset_url="$(jq -r '[.assets[] | select(.name | test("\\.zip$"; "i"))] | last | .browser_download_url // empty' /tmp/release.json)"
+          asset_name="$(jq -r '[.assets[] | select(.name | test("\\.zip$"; "i"))] | last | .name // empty' /tmp/release.json)"
+          if [[ -z "$asset_url" ]]; then
+            echo "::error title=Source ZIP tidak ditemukan::Release tag ${SOURCE_TAG} tidak memiliki asset .zip. Upload ZIP project lewat bot lalu ulangi build."
+            jq -r '"Release: " + (.html_url // "-") + "\nAsset tersedia: " + ([.assets[].name] | join(", "))' /tmp/release.json
+            exit 1
+          fi
+
+          echo "Mengunduh asset: ${asset_name}"
+          curl --fail --show-error --location \
+            -H "Authorization: Bearer ${GH_TOKEN}" \
+            -H "Accept: application/octet-stream" \
+            "$asset_url" -o /tmp/source.zip
+          if ! unzip -tq /tmp/source.zip >/dev/null; then
+            echo "::error title=Source ZIP rusak::File ZIP dari release tidak valid atau unduhan tidak lengkap."
+            exit 1
+          fi
+          mkdir -p source
+          unzip -q /tmp/source.zip -d source
+          echo "::endgroup::"
+
+      - name: Locate Flutter project
+        id: locate
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          pubspec="$(find source -type f -name pubspec.yaml -not -path '*/.dart_tool/*' -print -quit)"
+          if [[ -z "$pubspec" ]]; then
+            echo "::error title=Project Flutter tidak ditemukan::ZIP source tidak berisi pubspec.yaml. Pastikan yang diunggah adalah folder project Flutter, bukan APK atau ZIP bersarang yang salah."
+            echo "Struktur file teratas:"
+            find source -maxdepth 3 -type f | head -80
+            exit 1
+          fi
+          project_dir="$(dirname "$pubspec")"
+          echo "project_dir=$project_dir" >> "$GITHUB_OUTPUT"
+          echo "Project Flutter ditemukan: $project_dir"
+          if [[ ! -d "$project_dir/android" ]]; then
+            echo "::error title=Folder android tidak ditemukan::Project memiliki pubspec.yaml tetapi tidak memiliki folder android/. Buat/sertakan folder Android native dalam ZIP project."
+            exit 1
+          fi
+
+      - name: Set up Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+          cache: gradle
+
+      - name: Set up Flutter stable
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+
+      - name: Show tool versions
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          flutter --version
+          dart --version
+          java -version
+          flutter doctor -v
+
+      - name: Install Flutter dependencies
+        working-directory: ${{ steps.locate.outputs.project_dir }}
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          if [[ ! -f pubspec.yaml ]]; then
+            echo "::error title=pubspec.yaml tidak ada::Folder project hasil deteksi tidak valid."
+            exit 1
+          fi
+          flutter pub get -v
+
+      - name: Validate Dart source
+        working-directory: ${{ steps.locate.outputs.project_dir }}
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          flutter analyze --no-pub
+        continue-on-error: true
+
+      - name: Build APK
+        id: build
+        working-directory: ${{ steps.locate.outputs.project_dir }}
+        env:
+          BUILD_TYPE: ${{ inputs.build_type }}
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          case "$BUILD_TYPE" in
+            debug)
+              echo "Menjalankan Flutter debug build..."
+              flutter build apk --debug --no-pub -v
+              ;;
+            release)
+              echo "Menjalankan Flutter release build..."
+              flutter build apk --release --no-pub -v
+              ;;
+            *)
+              echo "::error title=build_type tidak valid::Nilai yang diterima hanya debug atau release."
+              exit 1
+              ;;
+          esac
+
+      - name: Verify APK output
+        id: apk
+        working-directory: ${{ steps.locate.outputs.project_dir }}
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          apk="$(find build/app/outputs/flutter-apk -maxdepth 1 -type f -name '*.apk' -size +0c -print -quit 2>/dev/null || true)"
+          if [[ -z "$apk" ]]; then
+            echo "::error title=APK output tidak ditemukan::Perintah build selesai tetapi APK tidak ditemukan di build/app/outputs/flutter-apk/."
+            find build -type f \( -name '*.apk' -o -name '*.log' \) 2>/dev/null | head -100 || true
+            exit 1
+          fi
+          mkdir -p "$GITHUB_WORKSPACE/apk-output"
+          cp "$apk" "$GITHUB_WORKSPACE/apk-output/app-${{ inputs.build_type }}.apk"
+          echo "apk_path=$GITHUB_WORKSPACE/apk-output/app-${{ inputs.build_type }}.apk" >> "$GITHUB_OUTPUT"
+          ls -lh "$GITHUB_WORKSPACE/apk-output"
+
+      - name: Upload APK artifact
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: apk-output
+          path: apk-output/*.apk
+          if-no-files-found: error
+          retention-days: 3
+
+      - name: Collect diagnostics on failure
+        if: failure()
+        working-directory: ${{ steps.locate.outputs.project_dir }}
+        shell: bash
+        run: |
+          {
+            echo "Build gagal."
+            echo "Repository: $GITHUB_REPOSITORY"
+            echo "Workflow run: $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+            echo "Build type: ${{ inputs.build_type }}"
+            echo
+            echo "=== Flutter/Dart/Java ==="
+            flutter --version 2>&1 || true
+            dart --version 2>&1 || true
+            java -version 2>&1 || true
+            echo
+            echo "=== Gradle / Flutter error files (jika ada) ==="
+            find . -type f \( -name '*.log' -o -name 'hs_err_pid*.log' \) \
+              -not -path './.git/*' -not -path './.dart_tool/*' -print 2>/dev/null | head -40
+            echo
+            echo "=== APK output yang ditemukan ==="
+            find build -type f -name '*.apk' -print 2>/dev/null | head -40 || true
+          } | tee "$GITHUB_WORKSPACE/build-diagnostics.txt"
+
+      - name: Upload diagnostics on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-diagnostics
+          path: |
+            build-diagnostics.txt
+            ${{ steps.locate.outputs.project_dir }}/build/**/outputs/**/*.apk
+          if-no-files-found: warn
+          retention-days: 7
 
